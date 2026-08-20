@@ -1,0 +1,90 @@
+name: Reusable / Traffic Snapshot
+
+# Called from another repo's own .github/workflows/traffic-snapshot.yml (see
+# the caller-workflow template in this repo's README). Fetches the calling
+# repo's 14-day traffic window and merges it into a durable JSON file in the
+# private fmasi/traffic-data repo.
+#
+# Why this exists: GitHub's traffic API (clones/views/referrers/popular paths)
+# only ever retains a rolling 14-day window, on every plan including
+# Enterprise Cloud — confirmed against GitHub's own docs, not paywalled by
+# any tier. Past that window the data is gone for good, for anyone. This job
+# runs daily so nothing is ever more than a day from being captured.
+#
+# Fix or improve this once here; every repo that calls it picks up the change
+# on its next scheduled run.
+
+on:
+  workflow_call:
+    secrets:
+      TRAFFIC_DATA_TOKEN:
+        required: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch this repo's traffic window
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          gh api "repos/$repo/traffic/clones" > clones.json
+          gh api "repos/$repo/traffic/views" > views.json
+          gh api "repos/$repo/traffic/popular/referrers" > referrers.json
+          gh api "repos/$repo/traffic/popular/paths" > paths.json
+
+      - name: Checkout traffic-data
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: fmasi/traffic-data
+          token: ${{ secrets.TRAFFIC_DATA_TOKEN }}
+          path: traffic-data
+
+      - name: Merge today's snapshot
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          name="${repo##*/}"
+          file="traffic-data/${name}.json"
+          today="$(date -u +%F)"
+          [ -f "$file" ] || echo '{"clones":{},"views":{},"referrers":{},"paths":{}}' > "$file"
+
+          # clones/views are per-day series from GitHub, keyed here by date so
+          # repeated daily runs overwrite the same key with the latest (and by
+          # then final) count for a given day rather than duplicating rows.
+          clones=$(jq '[.clones[] | {(.timestamp[0:10]): {count, uniques}}] | add // {}' clones.json)
+          views=$(jq '[.views[] | {(.timestamp[0:10]): {count, uniques}}] | add // {}' views.json)
+          # referrers/paths are not a daily series -- GitHub only ever reports
+          # a rolling top-N over the trailing 14 days -- so each is stored as
+          # a dated snapshot of that top-N, not merged into one running total.
+          referrers=$(jq '[.[] | {(.referrer): {count, uniques}}] | add // {}' referrers.json)
+          paths=$(jq '[.[] | {(.path): {count, uniques, title}}] | add // {}' paths.json)
+
+          jq --argjson clones "$clones" --argjson views "$views" \
+             --argjson referrers "$referrers" --argjson paths "$paths" \
+             --arg today "$today" '
+            .clones = (.clones + $clones) |
+            .views = (.views + $views) |
+            .referrers[$today] = $referrers |
+            .paths[$today] = $paths
+          ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+
+      - name: Commit and push if changed
+        working-directory: traffic-data
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          name="${repo##*/}"
+          git config user.name "traffic-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "${name}.json"
+          if git diff --cached --quiet; then
+            echo "No traffic changes to record for ${name}."
+          else
+            git commit -m "chore(${name}): traffic snapshot $(date -u +%F)"
+            git push origin main
+          fi
