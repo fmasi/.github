@@ -17,6 +17,14 @@ name: Reusable / Traffic Snapshot
 on:
   workflow_call:
     secrets:
+      TRAFFIC_READ_TOKEN:
+        required: true
+        description: >
+          Fine-grained PAT with Administration: Read on the calling repo (and
+          any others it covers). GITHUB_TOKEN cannot be granted this
+          permission at any setting -- confirmed against GitHub's own docs --
+          so the traffic API is structurally unreachable with the automatic
+          token, regardless of the `permissions:` block below.
       TRAFFIC_DATA_TOKEN:
         required: true
 
@@ -28,7 +36,7 @@ jobs:
     steps:
       - name: Fetch this repo's traffic window
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.TRAFFIC_READ_TOKEN }}
         run: |
           set -euo pipefail
           repo="${{ github.repository }}"
