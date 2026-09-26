@@ -1,0 +1,162 @@
+name: Reusable / Claude review
+
+# Claude PR review, run ONCE per PR (not on every push). Called from each
+# repo's thin .github/workflows/claude-review.yml (template in this repo's
+# README, "CI standard").
+#
+# Trigger: the caller listens on `pull_request: types: [ready_for_review,
+# labeled]`, and the job below gates itself. It runs only when
+#   - the PR is not a draft, AND
+#   - the head branch is in this same repo (fork PRs never see the token), AND
+#   - the PR was just marked ready for review, OR the `trigger-label` input
+#     (default `ready-for-review`) was just added.
+# Adding any other label starts a run whose job is skipped: free, and it does
+# not cancel a review in progress, because `concurrency` sits on the JOB (a
+# skipped job never joins the group), not on the workflow.
+#
+# Re-run a review: remove and re-add the `ready-for-review` label, or comment
+# `@claude review` on the PR (that one is served by claude-mention.yml).
+#
+# Check name in callers: `<caller-job-id> / claude-review`. With the standard
+# caller (job id `review`) that is `review / claude-review`; use that name in
+# branch protection. Don't give either job a `name:`, it would change it.
+#
+# The CALLER must grant these on the calling job (a called workflow can only
+# narrow the GITHUB_TOKEN, never widen it):
+#   permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: read }
+# and pass the secret explicitly:
+#   secrets: { CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} }
+#
+# Rubric: if `prompt-file` (default .github/claude-review-prompt.md, the same
+# file the local /ci-review reads) exists in the checked-out PR, it is inlined
+# into the prompt and Claude follows it. Otherwise a default rubric applies.
+# Either way the review lands as ONE summary comment on the PR.
+
+on:
+  workflow_call:
+    inputs:
+      prompt-file:
+        description: Repo-relative path of the review rubric. Used when it exists; a default rubric applies otherwise.
+        type: string
+        default: .github/claude-review-prompt.md
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 20
+      claude-args:
+        description: >
+          Extra Claude CLI args, appended after the defaults. `--allowedTools`
+          accumulates with the default list; a single-value flag such as
+          `--max-turns` given here overrides the default.
+        type: string
+        default: ""
+      trigger-label:
+        description: Label whose addition triggers a review.
+        type: string
+        default: ready-for-review
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: >
+          Claude Code OAuth token (from `/install-github-app` in Claude Code).
+          Optional so repos without it stay green: the job then posts a notice
+          and skips the Claude call. (A caller job with `uses:` cannot read
+          `secrets` in its own `if:`, so the skip has to live here.)
+        required: false
+
+jobs:
+  claude-review:
+    # Folded scalar: a plain `if:` value starting with `!` would parse as a YAML tag.
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action == 'ready_for_review' ||
+       (github.event.action == 'labeled' && github.event.label.name == inputs.trigger-label))
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Check for Claude token
+        id: token
+        env:
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" = "true" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set in this repo; skipping the Claude review."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Build review prompt
+        if: steps.token.outputs.present == 'true'
+        id: prompt
+        env:
+          PROMPT_FILE: ${{ inputs.prompt-file }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/review-prompt.md"
+          # shellcheck disable=SC2016 # the backticks are Markdown, not command substitution
+          {
+            printf 'REPO: %s\nPR NUMBER: %s\n\n' "$REPO" "$PR_NUMBER"
+            printf 'Review pull request #%s in %s. The PR is checked out in the working directory\n' "$PR_NUMBER" "$REPO"
+            printf '(a test merge into its base branch). Read the description and earlier discussion with\n'
+            printf '`gh pr view %s --comments`, the change with `gh pr diff %s`, and the surrounding code\n' "$PR_NUMBER" "$PR_NUMBER"
+            printf 'with Read, Grep and Glob.\n\n'
+            if [ -f "$PROMPT_FILE" ]; then
+              printf 'FOLLOW the repository'"'"'s review instructions below, from %s. They define what to check\n' "$PROMPT_FILE"
+              printf 'and how to rank it, and they take precedence over general review habits.\n\n'
+              printf -- '----- BEGIN %s -----\n' "$PROMPT_FILE"
+              cat "$PROMPT_FILE"
+              printf '\n----- END %s -----\n\n' "$PROMPT_FILE"
+            else
+              cat <<'RUBRIC'
+          No repository rubric was found, so use this one. Be concise and high-signal: flag only
+          what matters, never pad with praise. Check, in priority order:
+          1. Correctness: bugs, edge cases, broken or missing error handling, resource and
+             concurrency issues, behaviour that contradicts the PR description.
+          2. Security and privacy: leaked secrets or tokens, injection, unsafe deserialization,
+             sensitive data written to logs, over-broad permissions.
+          3. Tests: new or changed behaviour needs tests covering the happy path, edge cases and
+             invalid input. Name the untested behaviour.
+          4. Clarity: naming, dead code, consistency with surrounding code and the repo's own
+             conventions (CLAUDE.md or CONTRIBUTING if present), docs updated when behaviour changes.
+          Rank every finding by severity (Blocker, Major, Minor, Nit), each with file:line, what is
+          wrong, why it matters, and a concrete fix. If nothing significant turns up, say so in one line.
+
+          RUBRIC
+            fi
+            printf 'Deliver the review as exactly ONE top-level comment on the PR, posted with\n'
+            printf '`gh pr comment %s`. No inline comments, no approval or change request, no commits.\n' "$PR_NUMBER"
+          } > "$out"
+          delim="PROMPT_$(openssl rand -hex 16)"
+          { echo "prompt<<$delim"; cat "$out"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+
+      - name: Claude review
+        if: steps.token.outputs.present == 'true'
+        uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1 (2026-09-26)
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          # --max-turns 40: parley PR #126 hit error_max_turns at 20 on a large
+          # diff. The caller's claude-args come last so they can override it;
+          # --allowedTools values accumulate across flags.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Read,Grep,Glob"
+            ${{ inputs.claude-args }}

@@ -1,0 +1,204 @@
+name: Reusable / just ci
+
+# CI for new repos: CI == `just ci`, the exact recipe you run locally before a
+# push. Everything happens in ONE job, so a run bills one job-minute floor,
+# not one per step. Called from each repo's .github/workflows/ci.yml (template
+# in this repo's README, "CI standard").
+#
+# Steps: skip drafts -> checkout -> apt packages -> toolchain (`setup`) ->
+# `just` -> gitleaks -> `just <just-target>`.
+#
+# Deliberately NOT here:
+#   - `concurrency`: the caller holds it. In a called workflow the `github`
+#     context is the caller's, so the standard group expression would resolve
+#     to the caller's own group, and with cancel-in-progress the run would
+#     cancel itself (GitHub docs warn against exactly this).
+#   - `paths-ignore`: it belongs in no workflow that produces a required check.
+#
+# Check name in callers: `<caller-job-id> / ci` (standard caller: `ci / ci`).
+#
+# Permissions: the job needs only `contents: read`, which every repo's default
+# token grants, so the caller needs no `permissions:` block.
+#
+# Dependencies: python-uv needs no install step (`uv run` syncs from uv.lock);
+# python-poetry runs `poetry install`; python-pip installs requirements.txt and
+# requirements-dev.txt when present. Anything else goes in the justfile.
+
+on:
+  workflow_call:
+    inputs:
+      setup:
+        description: "Toolchain: python-uv | python-poetry | python-pip | shell | none"
+        type: string
+        default: none
+      python-version:
+        description: Python version for the python-* setups.
+        type: string
+        default: "3.12"
+      apt-packages:
+        description: Space-separated apt packages to install first (e.g. "tesseract-ocr poppler-utils").
+        type: string
+        default: ""
+      gitleaks:
+        description: Scan the new commits for secrets with gitleaks.
+        type: boolean
+        default: true
+      just-target:
+        description: The just recipe to run.
+        type: string
+        default: ci
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 20
+
+jobs:
+  ci:
+    # Skip drafts, but never skip push or workflow_dispatch. A skipped job
+    # counts as success for a required check.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      # gitleaks CLI, pinned by version and by the sha256 of its linux_x64
+      # tarball (from the release's checksums.txt, verified by download).
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Validate inputs
+        env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          case "$SETUP" in
+            python-uv|python-poetry|python-pip|shell|none) ;;
+            *) echo "::error::Unknown setup '$SETUP'. Use python-uv, python-poetry, python-pip, shell or none."; exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history when gitleaks scans a commit range. Strings on
+          # purpose: a numeric 0 is falsy in expressions.
+          fetch-depth: ${{ inputs.gitleaks && '0' || '1' }}
+
+      - name: Install apt packages
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euf -o pipefail
+          # shellcheck disable=SC2206 # split the package list on whitespace, globbing is off
+          pkgs=($APT_PACKAGES)
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+
+      # --- setup: python-uv -------------------------------------------------
+      - name: Set up uv and Python
+        if: inputs.setup == 'python-uv'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # auto = cache on for pull_request/push/dispatch, off for the
+          # cache-poisoning-prone events (pull_request_target, workflow_run).
+          enable-cache: auto
+          python-version: ${{ inputs.python-version }}
+
+      # --- setup: python-poetry ---------------------------------------------
+      # Poetry must exist before setup-python so its `cache: poetry` can ask
+      # Poetry where the cache lives.
+      - name: Install Poetry
+        if: inputs.setup == 'python-poetry'
+        run: pipx install poetry
+
+      - name: Set up Python (Poetry cache)
+        if: inputs.setup == 'python-poetry'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: poetry
+
+      - name: Install dependencies (Poetry)
+        if: inputs.setup == 'python-poetry'
+        run: |
+          poetry env use python
+          poetry install --no-interaction
+
+      # --- setup: python-pip ------------------------------------------------
+      - name: Set up Python (pip cache)
+        if: inputs.setup == 'python-pip'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+
+      - name: Install dependencies (pip)
+        if: inputs.setup == 'python-pip'
+        run: |
+          for f in requirements.txt requirements-dev.txt; do
+            if [ -f "$f" ]; then python -m pip install -r "$f"; fi
+          done
+
+      # --- setup: shell -----------------------------------------------------
+      - name: Confirm shellcheck
+        if: inputs.setup == 'shell'
+        run: shellcheck --version # preinstalled on GitHub's Ubuntu images
+
+      # --- common -----------------------------------------------------------
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      # The gitleaks CLI rather than gitleaks/gitleaks-action: the action's v2
+      # runs on Node 20 (gone from hosted runners since 2026-09-16), and on
+      # pull_request it lists the PR's commits through the API, which needs
+      # `pull-requests: read`, a scope the default read-only token lacks. The
+      # CLI needs no token, no API call and no license.
+      - name: Install gitleaks
+        if: inputs.gitleaks
+        run: |
+          set -euo pipefail
+          tgz="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL --retry 3 -o "$tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tgz}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # Scans the commits this event brings (PR: base..head, push:
+      # before..after), and the full history when there is no usable range
+      # (workflow_dispatch, a new branch, a force-push). Secrets are redacted
+      # in the log. Honours the repo's .gitleaks.toml and .gitleaksignore.
+      - name: Scan for secrets (gitleaks)
+        if: inputs.gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          base="" head=""
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" head="$PR_HEAD_SHA" ;;
+            push)         base="$PUSH_BEFORE" head="$PUSH_AFTER" ;;
+          esac
+          args=(git --no-banner --redact --verbose)
+          if [ -n "$base" ] && [ -n "$head" ] && [[ ! "$base" =~ ^0+$ ]] \
+             && git cat-file -e "${base}^{commit}" 2>/dev/null \
+             && git cat-file -e "${head}^{commit}" 2>/dev/null; then
+            echo "Scanning ${base}..${head}"
+            args+=(--log-opts="${base}..${head}")
+          else
+            echo "No usable commit range for '$EVENT_NAME'; scanning the full history."
+          fi
+          gitleaks "${args[@]}" .
+
+      - name: just ${{ inputs.just-target }}
+        env:
+          JUST_TARGET: ${{ inputs.just-target }}
+        run: just "$JUST_TARGET"
