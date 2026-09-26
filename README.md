@@ -4,6 +4,93 @@ Account-wide defaults and shared reusable GitHub Actions workflows for
 `fmasi` repos. "Maintain once, use many" — fix or improve a workflow here,
 every repo that calls it picks up the change on its next run.
 
+## CI standard (local-first)
+
+Every check runs on the laptop first (`just ci`, a local Claude review), and
+GitHub Actions runs once per PR, when it is marked ready. The canonical
+checklist and the audit script live in the owner's Claude Code skill
+`ci-guidelines` (`~/.claude/skills/ci-guidelines/CHEATSHEET.md`), not here.
+This repo holds the shared workflows the callers below point at.
+
+- Drafts cost nothing: CI and the review skip them.
+- `gh pr ready` (or adding the `ready-for-review` label) runs CI and one Claude
+  review. After fixes, pushes re-run CI only; comment `@claude review` for
+  another review.
+- `@claude` answers only the repo owner, members and collaborators.
+
+| Reusable workflow | Job id | Check name (standard caller) |
+|---|---|---|
+| `claude-review.yml` | `claude-review` | `review / claude-review` |
+| `claude-mention.yml` | `claude` | `claude / claude` |
+| `just-ci.yml` | `ci` | `ci / ci` |
+
+Repos without a `CLAUDE_CODE_OAUTH_TOKEN` secret stay green: both Claude
+workflows post a notice and skip the Claude call.
+
+`.github/workflows/claude-review.yml`:
+
+```yaml
+name: Claude review
+on:
+  pull_request:
+    types: [ready_for_review, labeled]
+jobs:
+  review:
+    uses: fmasi/.github/.github/workflows/claude-review.yml@main
+    permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: read }
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    # optional:
+    # with: { prompt-file: .github/claude-review-prompt.md, timeout-minutes: 20, claude-args: "", trigger-label: ready-for-review }
+```
+
+`.github/workflows/claude.yml`:
+
+```yaml
+name: Claude
+on:
+  issue_comment: { types: [created] }
+  pull_request_review_comment: { types: [created] }
+  pull_request_review: { types: [submitted] }
+  issues: { types: [opened] }
+jobs:
+  claude:
+    uses: fmasi/.github/.github/workflows/claude-mention.yml@main
+    permissions: { contents: write, pull-requests: write, issues: write, id-token: write, actions: read }
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    # optional: with: { timeout-minutes: 30, claude-args: "" }
+```
+
+`.github/workflows/ci.yml` (new repos; the caller holds `concurrency`, the
+reusable workflow must not):
+
+```yaml
+name: CI
+on:
+  pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
+  push: { branches: [main] }
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  ci:
+    uses: fmasi/.github/.github/workflows/just-ci.yml@main
+    with:
+      setup: python-uv          # python-uv | python-poetry | python-pip | shell | none
+      python-version: "3.12"
+      # apt-packages: "tesseract-ocr poppler-utils"
+      # gitleaks: true          (default; scans the PR's or push's commits)
+      # just-target: ci
+      # timeout-minutes: 20
+```
+
+Callers reference `@main`, not a tag or SHA, for the same reason as the
+traffic snapshot below: these are the owner's own workflows, and a fix here
+should reach every repo on its next run. Third-party actions inside them are
+pinned by commit SHA.
+
 ## Traffic snapshot
 
 GitHub's traffic API (clones, views, referrers, popular paths) only retains a
