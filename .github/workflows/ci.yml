@@ -1,0 +1,34 @@
+name: CI
+
+# This repo's own CI. It dogfoods just-ci.yml through a LOCAL reference, so a
+# PR tests its own version of the reusable workflow, with `workflow-lint: true`:
+# actionlint + zizmor (high severity) on every workflow here, using the pinned,
+# checksum-verified binaries just-ci.yml defines. Then `just test`: shellcheck
+# and the review-verdict parser tests (including the check that the copy inlined
+# in claude-review.yml matches scripts/review-verdict.sh).
+# Local mirror: `just ci` (= the same lint + `just test`).
+#
+# Check name: `ci / ci`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # just-ci.yml skips drafts (never push) and holds `timeout-minutes`.
+    uses: ./.github/workflows/just-ci.yml
+    with:
+      setup: shell
+      workflow-lint: true
+      just-target: test
+      timeout-minutes: 10

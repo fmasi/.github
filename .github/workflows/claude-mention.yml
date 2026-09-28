@@ -12,7 +12,9 @@ name: Reusable / Claude mention
 # against anyone dropping "@claude" into a public issue to spend the token and
 # minutes. Every other comment starts a run whose job is skipped, which is free.
 #
-# `@claude review` on a PR re-runs a review after fixes (see claude-review.yml).
+# `@claude review` on a PR gets a fresh look after fixes, but it does NOT update
+# the merge-gate labels. For a review that counts, remove and re-add the
+# `ready-for-review` label (see claude-review.yml).
 #
 # Check name in callers: `<caller-job-id> / claude` (standard caller: `claude / claude`).
 #

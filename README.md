@@ -12,37 +12,83 @@ checklist and the audit script live in the owner's Claude Code skill
 `ci-guidelines` (`~/.claude/skills/ci-guidelines/CHEATSHEET.md`), not here.
 This repo holds the shared workflows the callers below point at.
 
-- Drafts cost nothing: CI and the review skip them.
+- Drafts cost nothing: CI, the review and the gate skip them.
 - `gh pr ready` (or adding the `ready-for-review` label) runs CI and one Claude
-  review. After fixes, pushes re-run CI only; comment `@claude review` for
-  another review.
+  review. After fixes, pushes re-run CI only.
+- A Claude review is a **merge gate**: see "Claude review and merge gate" below.
 - `@claude` answers only the repo owner, members and collaborators.
 
 | Reusable workflow | Job id | Check name (standard caller) |
 |---|---|---|
-| `claude-review.yml` | `claude-review` | `review / claude-review` |
+| `claude-review.yml` | `claude-review` | `review / claude-review` (the review; NOT required) |
+| `claude-review.yml` | `review-gate` | `review / review-gate` (**required** in every repo) |
 | `claude-mention.yml` | `claude` | `claude / claude` |
 | `just-ci.yml` | `ci` | `ci / ci` |
 
-Repos without a `CLAUDE_CODE_OAUTH_TOKEN` secret stay green: both Claude
-workflows post a notice and skip the Claude call.
+### Claude review and merge gate
 
-`.github/workflows/claude-review.yml`:
+Each PR needs one passing Claude review to merge, and a top-severity finding
+blocks the merge until a re-review passes or the owner overrides it.
+
+- **The review** (`review / claude-review`) runs when the PR is marked ready or
+  gets the `ready-for-review` label. Claude posts ONE comment that ends with
+  `REVIEW-VERDICT: PASS` or `REVIEW-VERDICT: BLOCK`. BLOCK means at least one
+  Blocker/Critical finding: a bug that breaks behaviour, a security or privacy
+  flaw, data loss, or a leaked secret. A script (not Claude) reads that last
+  line and sets the labels; a missing verdict changes nothing and fails the job.
+- **The gate** (`review / review-gate`) runs on every non-draft PR event and
+  passes if and only if the PR has `claude-reviewed` and not `claude-blocked`,
+  read live from the API. Make it a required check; never the review itself.
+
+| Label | Meaning | Set by |
+|---|---|---|
+| `ready-for-review` | Adding it runs the review; remove and re-add it to re-run. | you or an agent |
+| `claude-reviewed` | The latest review passed, or the owner's override. | the workflow, or the owner |
+| `claude-blocked` | The latest review found a Critical issue: merge blocked. | the workflow |
+
+The workflow creates any missing labels. Labels survive pushes, so fix-up
+commits after a PASS don't need another review.
+
+```sh
+gh pr edit N --add-label ready-for-review                   # get a review
+gh pr edit N --remove-label ready-for-review && \
+  gh pr edit N --add-label ready-for-review                 # re-review after fixes
+gh pr edit N --remove-label claude-blocked --add-label claude-reviewed   # owner override
+```
+
+`@claude review` gets a fresh look but does not change the labels. When the
+review can't run, the gate stays red until the owner overrides it after a local
+`/ci-review`: PRs that change the review caller workflow (claude-code-action's
+workflow validation skips them), repos without the `CLAUDE_CODE_OAUTH_TOKEN`
+secret, and fork PRs. On a Dependabot PR, add `ready-for-review` yourself (the
+run is then yours, with secrets), or override.
+
+Labels set with `GITHUB_TOKEN` start no workflow runs, so a commit pushed
+while a review runs would leave the new head's gate stale. After labelling,
+the gate therefore re-runs every other `review-gate` job on the PR's current
+head whose result disagrees with the labels. That is why the caller grants
+`actions: write`; only the gate job holds it, never the job that runs Claude.
+
+`.github/workflows/claude-review.yml` (identical in every repo, and with NO
+`paths`/`paths-ignore`: a filtered-out required check never reports):
 
 ```yaml
 name: Claude review
 on:
   pull_request:
-    types: [ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 jobs:
   review:
     uses: fmasi/.github/.github/workflows/claude-review.yml@main
-    permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: read }
+    permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: write }
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
     # optional:
     # with: { prompt-file: .github/claude-review-prompt.md, timeout-minutes: 20, claude-args: "", trigger-label: ready-for-review }
 ```
+
+Put repo-specific exclusions (e.g. "ignore `eval/**`") in the rubric
+(`.github/claude-review-prompt.md`), not in the trigger.
 
 `.github/workflows/claude.yml`:
 
@@ -82,9 +128,18 @@ jobs:
       python-version: "3.12"
       # apt-packages: "tesseract-ocr poppler-utils"
       # gitleaks: true          (default; scans the PR's or push's commits)
+      # workflow-lint: false    (default; true = actionlint + zizmor --min-severity high)
       # just-target: ci
       # timeout-minutes: 20
 ```
+
+`workflow-lint: true` installs pinned, checksum-verified actionlint and zizmor
+and fails on actionlint errors or high-severity zizmor findings. Mirror it in
+`just ci` with `actionlint && zizmor --min-severity high .github/workflows`.
+
+This repo's own CI (`ci.yml`) calls `just-ci.yml` locally with
+`workflow-lint: true`, then runs `just test` (shellcheck plus the verdict
+parser's tests). Run `just ci` before pushing.
 
 Callers reference `@main`, not a tag or SHA, for the same reason as the
 traffic snapshot below: these are the owner's own workflows, and a fix here

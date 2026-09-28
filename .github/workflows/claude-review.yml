@@ -1,29 +1,88 @@
 name: Reusable / Claude review
 
-# Claude PR review, run ONCE per PR (not on every push). Called from each
-# repo's thin .github/workflows/claude-review.yml (template in this repo's
-# README, "CI standard").
+# One Claude PR review, plus the MERGE GATE that turns its verdict into a
+# required check. Called from each repo's thin .github/workflows/claude-review.yml
+# (caller template in this repo's README, "Claude review and merge gate").
 #
-# Trigger: the caller listens on `pull_request: types: [ready_for_review,
-# labeled]`, and the job below gates itself. It runs only when
-#   - the PR is not a draft, AND
-#   - the head branch is in this same repo (fork PRs never see the token), AND
-#   - the PR was just marked ready for review, OR the `trigger-label` input
-#     (default `ready-for-review`) was just added.
-# Adding any other label starts a run whose job is skipped: free, and it does
-# not cancel a review in progress, because `concurrency` sits on the JOB (a
-# skipped job never joins the group), not on the workflow.
+# Checks (standard caller, job id `review`; never give these jobs a `name:`):
+#   review / claude-review  the review itself. NOT a required check.
+#   review / review-gate    the merge gate. REQUIRED in every repo's ruleset.
 #
-# Re-run a review: remove and re-add the `ready-for-review` label, or comment
-# `@claude review` on the PR (that one is served by claude-mention.yml).
+# Triggers. The caller listens on `pull_request: types: [opened, synchronize,
+# reopened, ready_for_review, labeled, unlabeled]`, with NO paths filter: the
+# gate is required, and a filtered-out required check never reports.
+#   - claude-review runs only when the PR is not a draft, its head branch is in
+#     this repo (fork PRs never see the token), and the PR was just marked
+#     ready for review OR the `trigger-label` input (default
+#     `ready-for-review`) was just added. Every other event skips it (free).
+#     Its `concurrency` sits on the job, so an unrelated label never cancels a
+#     running review; a new trigger does.
+#   - review-gate runs on every event on a non-draft PR, after claude-review
+#     (`needs` + `if: always()`). On ready/label it judges the labels the review
+#     has just set; on a push the review is skipped and the gate runs at once.
+#     Drafts skip it: a skipped required check counts as passed, and drafts
+#     can't merge anyway.
 #
-# Check name in callers: `<caller-job-id> / claude-review`. With the standard
-# caller (job id `review`) that is `review / claude-review`; use that name in
-# branch protection. Don't give either job a `name:`, it would change it.
+# Labels (either job creates any that are missing):
+#   ready-for-review  adding it runs the review; remove and re-add it to re-run.
+#   claude-reviewed   the latest review PASSED, or the owner's manual override.
+#   claude-blocked    the latest review found a top-severity (Blocker/Critical)
+#                     issue. It blocks until a later review passes or the owner
+#                     overrides.
+# The gate passes if and only if the PR has `claude-reviewed` and does not have
+# `claude-blocked`. It reads the labels live from the API, never from the event
+# payload. Labels survive pushes: fix-up commits after a PASS need no new review.
+#
+# Verdict. The prompt makes Claude END its one comment with the line
+# `REVIEW-VERDICT: PASS` or `REVIEW-VERDICT: BLOCK`. BLOCK is only for
+# top-severity findings: a bug that breaks behaviour, a security or privacy
+# flaw, data loss, a leaked secret. A deterministic step, not Claude, then
+# takes the newest comment by claude[bot] created since this job started that
+# contains `REVIEW-VERDICT:`, reads its LAST non-blank line and sets the labels.
+# PASS adds claude-reviewed, then removes claude-blocked; BLOCK adds
+# claude-blocked, then removes claude-reviewed. Adding before removing means the
+# gate can never catch a half-applied state that looks green. A missing or
+# malformed verdict sets no labels and fails the job. The parser's tested,
+# canonical copy is scripts/review-verdict.sh; CI fails if the copy inlined below
+# drifts from it.
+#
+# Re-review after fixes: remove and re-add the trigger label.
+#   gh pr edit N --remove-label ready-for-review && gh pr edit N --add-label ready-for-review
+# (`@claude review`, served by claude-mention.yml, does NOT update the labels.)
+#
+# Owner override, for a review that can't run or a BLOCK you overrule:
+#   gh pr edit N --remove-label claude-blocked --add-label claude-reviewed
+# The gate can't see WHO added a label, and anyone with triage access can add
+# one. That is fine for single-owner repos; revisit it for shared ones.
+#
+# When there is no verdict, the gate stays red until a review passes or the owner overrides:
+#   - PRs that change the caller workflow: claude-code-action's "workflow
+#     validation" skips the review and posts nothing, so the job fails.
+#   - Repos without CLAUDE_CODE_OAUTH_TOKEN: the review is skipped with a notice
+#     (fix: `gh secret set CLAUDE_CODE_OAUTH_TOKEN`).
+#   - Fork PRs: never reviewed here. Review locally with /ci-review, then override.
+#   - Dependabot PRs: add `ready-for-review` yourself (the run is then yours, with
+#     secrets), or override.
+#
+# Race 2 (labels set with GITHUB_TOKEN start no workflow runs). If a commit lands
+# while a review runs, the new head's gate runs before the labels change: it
+# stays red after a PASS, or stale green after a BLOCK. Option (a), labelling with
+# the Claude App token so that the `labeled` event re-runs the gate, does not
+# work. claude-code-action@756cc22 does expose that token as its `github_token`
+# output, but the action's own last step ("Revoke app token", `if: always()`)
+# revokes it before any later step can use it. So this uses option (b). Right
+# after a review has set the labels, this run's review-gate job waits for the
+# other runs of this workflow on the PR's CURRENT head SHA to finish. It then
+# re-runs every review-gate job whose result disagrees with the labels
+# (POST /actions/jobs/{id}/rerun), and each re-run reads the labels live. That
+# needs `actions: write`, and only review-gate holds it: the job that runs
+# Claude keeps `actions: read`, so a prompt-injected review can't dispatch or
+# re-run workflows. Only a gate in the same run attempt as a review that set
+# labels re-runs anything, so a re-run gate never re-runs others: no loops.
 #
 # The CALLER must grant these on the calling job (a called workflow can only
 # narrow the GITHUB_TOKEN, never widen it):
-#   permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: read }
+#   permissions: { contents: read, pull-requests: write, issues: write, id-token: write, actions: write }
 # and pass the secret explicitly:
 #   secrets: { CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} }
 #
@@ -40,7 +99,7 @@ on:
         type: string
         default: .github/claude-review-prompt.md
       timeout-minutes:
-        description: Job timeout.
+        description: Job timeout for the review (the gate has its own 5 minutes).
         type: number
         default: 20
       claude-args:
@@ -58,10 +117,13 @@ on:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: >
           Claude Code OAuth token (from `/install-github-app` in Claude Code).
-          Optional so repos without it stay green: the job then posts a notice
-          and skips the Claude call. (A caller job with `uses:` cannot read
-          `secrets` in its own `if:`, so the skip has to live here.)
+          Optional: without it the review job posts a notice and skips the Claude
+          call, and the gate stays red until the owner overrides. (A caller job
+          with `uses:` cannot read `secrets` in its own `if:`, so the skip has
+          to live here.)
         required: false
+
+permissions: {}
 
 jobs:
   claude-review:
@@ -77,12 +139,22 @@ jobs:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      id-token: write
-      actions: read
+      contents: read # check out the PR
+      pull-requests: write # Claude posts its review comment
+      issues: write # labels are issue objects: create them, add and remove them
+      id-token: write # claude-code-action trades the OIDC token for its App token
+      actions: read # lets Claude read CI results; NOT write (see "Race 2" above)
+    outputs:
+      # Read by review-gate: a verdict means the labels changed in this run.
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      # The attempt this job really ran in. When only review-gate is re-run,
+      # GitHub reuses this job's outputs, so the two attempts differ.
+      attempt: ${{ github.run_attempt }}
     steps:
+      - name: Record review start
+        id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Check for Claude token
         id: token
         env:
@@ -91,7 +163,7 @@ jobs:
           if [ "$HAS_TOKEN" = "true" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set in this repo; skipping the Claude review."
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set in this repo; skipping the Claude review. The review gate stays red until the secret is set (gh secret set CLAUDE_CODE_OAUTH_TOKEN) or the owner adds the claude-reviewed label."
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -100,6 +172,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Build review prompt
         if: steps.token.outputs.present == 'true'
@@ -142,12 +215,24 @@ jobs:
           RUBRIC
             fi
             printf 'Deliver the review as exactly ONE top-level comment on the PR, posted with\n'
-            printf '`gh pr comment %s`. No inline comments, no approval or change request, no commits.\n' "$PR_NUMBER"
+            printf '`gh pr comment %s`. No inline comments, no approval or change request, no commits.\n\n' "$PR_NUMBER"
+            cat <<'VERDICT'
+          MERGE VERDICT. The comment MUST END with exactly one of these two lines, alone on the
+          last line, in plain text (no backticks, bold, quote marks or list marker), with nothing
+          after it:
+          REVIEW-VERDICT: PASS
+          REVIEW-VERDICT: BLOCK
+          Write BLOCK if and only if at least one finding is at the rubric's top severity (Blocker
+          or Critical): a bug that breaks behaviour, a security or privacy flaw, data loss, or a
+          leaked secret. Anything less severe is PASS, with the findings still listed. A script
+          reads that last line to decide whether the PR may merge.
+          VERDICT
           } > "$out"
           delim="PROMPT_$(openssl rand -hex 16)"
           { echo "prompt<<$delim"; cat "$out"; echo "$delim"; } >> "$GITHUB_OUTPUT"
 
       - name: Claude review
+        id: claude
         if: steps.token.outputs.present == 'true'
         uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1 (2026-09-26)
         with:
@@ -160,3 +245,206 @@ jobs:
             --max-turns 40
             --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Read,Grep,Glob"
             ${{ inputs.claude-args }}
+
+      # Deterministic: parses the verdict and sets the labels. Runs even when the
+      # Claude step failed (a verdict posted before a late failure still counts).
+      - name: Apply review verdict
+        id: verdict
+        if: ${{ !cancelled() && steps.token.outputs.present == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.at }}
+          TRIGGER_LABEL: ${{ inputs.trigger-label }}
+          CLAUDE_CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+          VERDICT_AUTHOR: claude[bot]
+        run: |
+          set -euo pipefail
+          # BEGIN review_verdict
+          review_verdict() {
+            # $1 = comments JSON file, $2 = SINCE (ISO-8601 UTC), $3 = author login
+            jq -r --arg since "$2" --arg author "$3" '
+              [ .[]
+                | select(.user.login == $author
+                         and .created_at >= $since
+                         and ((.body // "") | contains("REVIEW-VERDICT:"))) ]
+              | sort_by(.created_at, .id)
+              | last
+              | if . == null then "NONE"
+                else
+                  ( .body | gsub("\r"; "") | split("\n")
+                    | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+                    | last // "" ) as $line
+                  | ($line | capture("^[*_`]*REVIEW-VERDICT: (?<v>PASS|BLOCK)[*_`]*$") | .v)
+                    // "INVALID"
+                end
+            ' "$1"
+          }
+          # END review_verdict
+          uri() { jq -rn --arg s "$1" '$s | @uri'; }
+          ensure_label() { # NAME COLOR DESCRIPTION
+            gh api "repos/$REPO/labels/$(uri "$1")" --silent 2>/dev/null && return 0
+            gh api -X POST "repos/$REPO/labels" -f name="$1" -f color="$2" -f description="$3" --silent 2>/dev/null \
+              || gh api "repos/$REPO/labels/$(uri "$1")" --silent # a parallel run may have made it first
+          }
+          ensure_label "$TRIGGER_LABEL" 1d76db "Runs the Claude review; remove and re-add it to re-run"
+          ensure_label claude-reviewed 0e8a16 "Latest Claude review passed, or the owner's override (merge gate)"
+          ensure_label claude-blocked b60205 "Latest Claude review found a Critical issue: merge blocked"
+
+          comments="$RUNNER_TEMP/pr-comments.json"
+          # `since` filters on updated_at (>= created_at): a superset; the parser filters on created_at.
+          gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments?since=$SINCE&per_page=100" \
+            | jq -s 'add // []' > "$comments"
+          verdict=$(review_verdict "$comments" "$SINCE" "$VERDICT_AUTHOR")
+          echo "Verdict: $verdict (newest $VERDICT_AUTHOR comment since $SINCE)"
+
+          case "$verdict" in
+            PASS) add=claude-reviewed remove=claude-blocked ;;
+            BLOCK) add=claude-blocked remove=claude-reviewed ;;
+            *)
+              if [ "$verdict" = NONE ]; then
+                reason="No comment by $VERDICT_AUTHOR since $SINCE contains a REVIEW-VERDICT line."
+              else
+                reason="The newest review comment by $VERDICT_AUTHOR does not END with 'REVIEW-VERDICT: PASS' or 'REVIEW-VERDICT: BLOCK'."
+              fi
+              if [ -z "$CLAUDE_CONCLUSION" ]; then
+                hint="Claude did not run to completion. Usual cause: this PR changes the caller workflow, and claude-code-action's workflow validation skips such PRs (see the Claude review step's log)."
+              else
+                hint="The Claude step ended with '$CLAUDE_CONCLUSION' but left no usable verdict."
+              fi
+              echo "::error title=No review verdict::$reason Labels unchanged, so the review gate keeps its current state. $hint Re-review: gh pr edit $PR_NUMBER --remove-label $TRIGGER_LABEL && gh pr edit $PR_NUMBER --add-label $TRIGGER_LABEL. Owner override: gh pr edit $PR_NUMBER --remove-label claude-blocked --add-label claude-reviewed"
+              exit 1
+              ;;
+          esac
+
+          # Add before remove: a gate reading in between sees both labels, which is red.
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$add" --silent
+          if gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' | grep -Fxq -- "$remove"; then
+            gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(uri "$remove")" --silent
+          fi
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "Labels set: +$add -$remove"
+          if [ "$verdict" = BLOCK ]; then
+            echo "::warning title=Claude review BLOCK::A top-severity finding blocks the merge. Fix it and re-review, or the owner overrides (see the review-gate job)."
+          fi
+
+  review-gate:
+    needs: claude-review
+    # always(): also after a failed, skipped or cancelled review. Drafts skip.
+    if: ${{ always() && !github.event.pull_request.draft }}
+    # 1-vCPU runner: GA since 2026-01-22, public and private repos, has gh and jq.
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read # read the PR's labels and current head SHA
+      issues: write # create the gate's labels when missing
+      actions: write # re-run stale review-gate jobs on the current head ("Race 2")
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      TRIGGER_LABEL: ${{ inputs.trigger-label }}
+    steps:
+      # So that the failure message's `gh pr edit --add-label` works from the
+      # first PR on. Best effort: fork and Dependabot runs have read-only tokens.
+      - name: Create the gate labels if missing
+        run: |
+          set -uo pipefail
+          uri() { jq -rn --arg s "$1" '$s | @uri'; }
+          ensure_label() { # NAME COLOR DESCRIPTION
+            gh api "repos/$REPO/labels/$(uri "$1")" --silent 2>/dev/null && return 0
+            gh api -X POST "repos/$REPO/labels" -f name="$1" -f color="$2" -f description="$3" --silent 2>/dev/null \
+              || gh api "repos/$REPO/labels/$(uri "$1")" --silent 2>/dev/null
+          }
+          ensure_label "$TRIGGER_LABEL" 1d76db "Runs the Claude review; remove and re-add it to re-run" \
+            && ensure_label claude-reviewed 0e8a16 "Latest Claude review passed, or the owner's override (merge gate)" \
+            && ensure_label claude-blocked b60205 "Latest Claude review found a Critical issue: merge blocked" \
+            || echo "::notice::Could not create the review labels (read-only token: fork or Dependabot PR). The first review, or the owner, creates them."
+
+      # Race 2: only in the attempt whose review just set the labels.
+      - name: Re-run stale gates on the PR's current head
+        if: needs.claude-review.outputs.verdict != '' && needs.claude-review.outputs.attempt == github.run_attempt
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+          labels=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name')
+          if grep -Fxq claude-reviewed <<<"$labels" && ! grep -Fxq claude-blocked <<<"$labels"; then
+            want=success
+          else
+            want=failure
+          fi
+          wf_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .workflow_id)
+          echo "Current head: $head_sha. The labels say every review-gate on it should end: $want."
+
+          # A run can only be re-run once it has completed, so wait for the
+          # other runs on this head (a push's run finishes in seconds).
+          runs="$RUNNER_TEMP/runs.json"
+          deadline=$((SECONDS + 180))
+          while :; do
+            gh api "repos/$REPO/actions/workflows/$wf_id/runs?head_sha=$head_sha&event=pull_request&per_page=100" \
+              --jq "[.workflow_runs[]
+                     | select(.id != $RUN_ID)
+                     | select((.pull_requests | length) == 0 or any(.pull_requests[]; .number == $PR_NUMBER))
+                     | {id, status}]" > "$runs"
+            busy=$(jq '[.[] | select(.status != "completed")] | length' "$runs")
+            [ "$busy" -eq 0 ] && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::warning::$busy other run(s) on $head_sha still running after 3 minutes; not re-running them. If one of their review-gate checks ends wrong, re-run it by hand."
+              break
+            fi
+            echo "Waiting for $busy other run(s) on $head_sha to finish..."
+            sleep 10
+          done
+
+          reran=0
+          for run in $(jq -r '.[] | select(.status == "completed") | .id' "$runs"); do
+            gates=$(gh api "repos/$REPO/actions/runs/$run/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.name == "review-gate" or (.name | endswith("/ review-gate"))) | "\(.id) \(.conclusion)"')
+            while read -r job conclusion; do
+              [ -n "$job" ] || continue
+              case "$want:$conclusion" in
+                *:skipped) continue ;; # a draft-time event: a re-run would skip again
+                success:success) continue ;; # already right
+                failure:success) ;; # stale green after a BLOCK: re-run
+                failure:*) continue ;; # already not green
+                success:*) ;; # stale red (or cancelled) after a PASS: re-run
+              esac
+              echo "Re-running review-gate job $job of run $run: it ended '$conclusion', the labels now say '$want'."
+              if gh api -X POST "repos/$REPO/actions/jobs/$job/rerun" --silent; then
+                reran=$((reran + 1))
+              else
+                echo "::warning::Could not re-run job $job of run $run; re-run it by hand if its check is wrong."
+              fi
+            done <<<"$gates"
+          done
+          echo "Re-ran $reran stale review-gate job(s) on $head_sha."
+
+      - name: Check the review labels
+        run: |
+          set -euo pipefail
+          labels=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name')
+          has() { grep -Fxq -- "$1" <<<"$labels"; }
+          rerun="gh pr edit $PR_NUMBER --remove-label $TRIGGER_LABEL && gh pr edit $PR_NUMBER --add-label $TRIGGER_LABEL"
+          override="gh pr edit $PR_NUMBER --remove-label claude-blocked --add-label claude-reviewed"
+          if has claude-blocked; then
+            title="Claude review blocked the merge"
+            msg="The latest Claude review found a top-severity issue (see its comment on the PR). Fix it, then re-review: $rerun. Owner override: $override"
+          elif has claude-reviewed; then
+            echo "Review gate passed: claude-reviewed is set and claude-blocked is not."
+            exit 0
+          else
+            title="No passing Claude review"
+            msg="PR #$PR_NUMBER needs a passing Claude review to merge. Get one: gh pr edit $PR_NUMBER --add-label $TRIGGER_LABEL (or from a draft: gh pr ready $PR_NUMBER). To re-review: $rerun. If the review cannot run (the PR changes the review workflow, no CLAUDE_CODE_OAUTH_TOKEN secret, a fork PR), review locally with /ci-review and the owner overrides: gh pr edit $PR_NUMBER --add-label claude-reviewed"
+          fi
+          echo "::error title=$title::$msg"
+          {
+            echo "### $title"
+            echo
+            echo "$msg"
+            echo
+            echo "Labels now: $(tr '\n' ' ' <<<"$labels")"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

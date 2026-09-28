@@ -1,0 +1,13 @@
+# Block style only: `{staged_files}` inside a `{ ... }` flow mapping is invalid YAML.
+pre-commit:
+  parallel: true
+  commands:
+    secrets:
+      run: gitleaks git --staged --no-banner --redact
+    workflows:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: actionlint
+pre-push:
+  commands:
+    ci:
+      run: just ci # skip once with: git push --no-verify (owner only)
