@@ -6,7 +6,14 @@ name: Reusable / just ci
 # in this repo's README, "CI standard").
 #
 # Steps: skip drafts -> checkout -> apt packages -> toolchain (`setup`) ->
-# `just` -> gitleaks -> `just <just-target>`.
+# `just` -> gitleaks -> workflow lint (opt-in) -> `just <just-target>`.
+#
+# `workflow-lint: true` (default false) lints .github/workflows with actionlint
+# (which also runs the runner's shellcheck on `run:` scripts) and zizmor
+# (`--min-severity high`: only high-severity findings fail). Both are pinned
+# release binaries, checksum-verified. Mirror them locally in `just ci`:
+#   actionlint && zizmor --min-severity high .github/workflows
+# (GH_TOKEN set, as here, lets zizmor run its online audits too.)
 #
 # Deliberately NOT here:
 #   - `concurrency`: the caller holds it. In a called workflow the `github`
@@ -43,6 +50,10 @@ on:
         description: Scan the new commits for secrets with gitleaks.
         type: boolean
         default: true
+      workflow-lint:
+        description: Lint .github/workflows with actionlint and zizmor (fails on high-severity findings only).
+        type: boolean
+        default: false
       just-target:
         description: The just recipe to run.
         type: string
@@ -66,6 +77,14 @@ jobs:
       # tarball (from the release's checksums.txt, verified by download).
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      # actionlint and zizmor, same scheme: the actionlint sha256 is from the
+      # release's checksums.txt; zizmor ships no checksum file, so its sha256
+      # is the asset digest GitHub's release API reports, both verified by
+      # download on 2026-09-28.
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      ZIZMOR_VERSION: 1.30.1
+      ZIZMOR_SHA256: e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
     steps:
       - name: Validate inputs
         env:
@@ -197,6 +216,36 @@ jobs:
             echo "No usable commit range for '$EVENT_NAME'; scanning the full history."
           fi
           gitleaks "${args[@]}" .
+
+      - name: Install actionlint and zizmor
+        if: inputs.workflow-lint
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          a="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL --retry 3 -o "$a" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${a}" | sha256sum -c -
+          tar -xzf "$a" -C "$RUNNER_TEMP/bin" actionlint
+          z="$RUNNER_TEMP/zizmor.tar.gz"
+          curl -fsSL --retry 3 -o "$z" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  ${z}" | sha256sum -c -
+          tar -xzf "$z" -C "$RUNNER_TEMP/bin" zizmor
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint workflows (actionlint, zizmor)
+        if: inputs.workflow-lint
+        env:
+          # Read-only token: zizmor's online audits (impostor commits, known-
+          # vulnerable actions) query public GitHub data with it.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          actionlint -version
+          actionlint
+          zizmor --version
+          zizmor --min-severity high .github/workflows
 
       - name: just ${{ inputs.just-target }}
         env:
