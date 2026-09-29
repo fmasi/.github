@@ -171,7 +171,7 @@ jobs:
         if: steps.token.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0 # full history, so read-only git log/diff/blame work
           persist-credentials: false
 
       - name: Build review prompt
@@ -214,8 +214,16 @@ jobs:
 
           RUBRIC
             fi
-            printf 'Deliver the review as exactly ONE top-level comment on the PR, posted with\n'
-            printf '`gh pr comment %s`. No inline comments, no approval or change request, no commits.\n\n' "$PR_NUMBER"
+            printf 'Deliver the review as exactly ONE top-level comment on the PR. No inline comments, no\n'
+            printf 'approval or change request, no commits.\n\n'
+            printf 'HOW TO WORK (the tools are restricted; a refused call wastes a turn):\n'
+            printf -- '- Allowed: gh pr view, gh pr diff, gh pr comment, read-only git (diff, log, show, blame,\n'
+            printf '  status), and the Read, Grep, Glob and Write tools. Run ONE plain command per call: pipes,\n'
+            printf '  redirects, `&&`, `cd`, heredocs and command substitution are all refused.\n'
+            printf -- '- Large PR: start with `gh pr diff %s --name-only`, then Read the changed files that matter.\n' "$PR_NUMBER"
+            printf -- '- Write the full review with the Write tool to %s/review-comment.md, then post it with\n' "$RUNNER_TEMP"
+            printf '  `gh pr comment %s --body-file %s/review-comment.md`.\n' "$PR_NUMBER" "$RUNNER_TEMP"
+            printf -- '- Keep enough turns to post. An unposted review counts as no review.\n\n'
             cat <<'VERDICT'
           MERGE VERDICT. The comment MUST END with exactly one of these two lines, alone on the
           last line, in plain text (no backticks, bold, quote marks or list marker), with nothing
@@ -238,12 +246,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: ${{ steps.prompt.outputs.prompt }}
-          # --max-turns 40: parley PR #126 hit error_max_turns at 20 on a large
-          # diff. The caller's claude-args come last so they can override it;
-          # --allowedTools values accumulate across flags.
+          # --max-turns 50: parley PR #126 hit error_max_turns at 20 on a large diff, and
+          # JoBot PR #72 (24 commits + a merge) ended with no comment after 30 refused tool
+          # calls. Read-only git and Write (for the --body-file comment) stop that. The
+          # caller's claude-args come last so they can override; --allowedTools accumulates.
           claude_args: |
-            --max-turns 40
-            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Read,Grep,Glob"
+            --max-turns 50
+            --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(git status:*),Read,Grep,Glob,Write"
             ${{ inputs.claude-args }}
 
       # Deterministic: parses the verdict and sets the labels. Runs even when the
